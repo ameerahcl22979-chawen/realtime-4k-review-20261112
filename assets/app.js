@@ -16,7 +16,7 @@
   let interaction = null;
   let loadSequence = 0;
   let rowObserver = null;
-  const ROW_BATCH = 12;
+  const ROW_BATCH = 6;
 
   const esc = (value) => String(value).replace(/[&<>"']/g, (char) => ({
     "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#039;",
@@ -78,11 +78,11 @@
       if ("IntersectionObserver" in window) {
         rowObserver = new IntersectionObserver((entries) => {
           if (entries.some((entry) => entry.isIntersecting)) appendRows();
-        }, { root: app.querySelector(".showcase"), rootMargin: "700px" });
+        }, { root: app.querySelector(".showcase"), rootMargin: "200px" });
         rowObserver.observe(marker);
       } else {
         app.querySelector(".showcase").addEventListener("scroll", () => {
-          if (marker.getBoundingClientRect().top < window.innerHeight + 700) appendRows();
+          if (marker.getBoundingClientRect().top < window.innerHeight + 200) appendRows();
         });
       }
     } else marker.remove();
@@ -180,15 +180,7 @@
       const image = event.target.closest("[data-single]");
       if (image) openSingle(image.dataset.single, image.dataset.key);
     });
-    grid.addEventListener("pointerover", (event) => {
-      const image = event.target.closest("[data-single]");
-      if (image && !image.contains(event.relatedTarget))
-        image._prefetchTimer = window.setTimeout(() => preloadFull(image.dataset.full), 450);
-    });
-    grid.addEventListener("pointerout", (event) => {
-      const image = event.target.closest("[data-single]");
-      if (image && !image.contains(event.relatedTarget)) window.clearTimeout(image._prefetchTimer);
-    });
+
     app.querySelector("[data-group-prev]").addEventListener("click", () => changeGroup(-1));
     app.querySelector("[data-group-next]").addEventListener("click", () => changeGroup(1));
     app.querySelector(".single-prev").addEventListener("click", () => changeSingle(-1));
