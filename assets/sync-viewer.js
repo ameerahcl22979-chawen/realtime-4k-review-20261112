@@ -1,0 +1,318 @@
+(() => {
+  const legacyColumns = [
+    ["original", "原图"], ["low_default", "低强度·自然调"], ["low_warm", "低强度·暖调"],
+    ["low_neutral", "低强度·冷调"], ["high_default", "高强度·自然调"], ["high_warm", "高强度·暖调"],
+    ["high_neutral", "高强度·冷调"],
+  ];
+  let columns = legacyColumns;
+  let fourMode = false;
+  const lowColumns = [["original", "原图"], ["low_default", "自然调"], ["low_warm", "暖调"], ["low_neutral", "冷调"]];
+  const currentColumns = () => fourMode ? (window.REVIEW_DATA.datasets[dataset].columns || lowColumns) : legacyColumns;
+  const fullCache = new Map();
+  let dialog;
+  let dataset = "0923";
+  let sceneIndex = 0;
+  let zoom = 1;
+  let centerX = 0.5;
+  let centerY = 0.5;
+  let drag = null;
+  let opener = null;
+  let loadToken = 0;
+
+  function scenes() {
+    return window.REVIEW_DATA?.datasets?.[dataset]?.scenes || [];
+  }
+
+  function init() {
+    dialog = document.createElement("div");
+    dialog.className = "sync-dialog" + (columns.length === 4 ? " four-columns" : "");
+    dialog.setAttribute("role", "dialog");
+    dialog.setAttribute("aria-modal", "true");
+    dialog.setAttribute("aria-label", "细节对比");
+    dialog.innerHTML = `<div class="sync-panel"><div class="sync-header"><strong class="sync-title"></strong>${fourMode ? `<div class="sync-versions" role="tablist" aria-label="细节对比版本">${Object.entries(window.REVIEW_DATA.datasets).map(([key, value]) => `<button type="button" data-sync-dataset="${key}" role="tab">${value.label}</button>`).join("")}</div>` : ""}<div class="sync-controls"><button type="button" data-action="prev" title="上一组" aria-label="上一组">‹</button><button type="button" data-action="next" title="下一组" aria-label="下一组">›</button><button type="button" data-action="out" title="缩小" aria-label="缩小">−</button><button type="button" data-action="actual" title="原尺寸，同步定位">1:1</button><button type="button" data-action="in" title="放大" aria-label="放大">+</button><button type="button" data-action="fit" title="适应窗口">适应</button><span class="sync-readout">100%</span><button type="button" data-action="export" title="保存当前缩放与位置的四列对比图">导出当前对比</button></div><button type="button" class="sync-close" data-action="close" title="关闭" aria-label="关闭">×</button></div><div class="sync-grid" style="grid-template-columns:repeat(${columns.length},minmax(0,1fr))">${columns.map(([key, label]) => `<figure class="sync-column"><figcaption>${label}</figcaption><div class="sync-viewport" data-key="${key}" tabindex="0"><img alt="${label}" draggable="false"></div></figure>`).join("")}</div></div>`;
+    document.body.append(dialog);
+    dialog.addEventListener("click", (event) => {
+      if (event.target === dialog) return close();
+      const version = event.target.closest("[data-sync-dataset]");
+      if (version) { switchDataset(version.dataset.syncDataset); return; }
+      const action = event.target.closest("[data-action]")?.dataset.action;
+      if (action === "close") close();
+      if (action === "prev") changeScene(-1);
+      if (action === "next") changeScene(1);
+      if (action === "in") setZoom(zoom * 1.25);
+      if (action === "out") setZoom(zoom / 1.25);
+      if (action === "fit") reset();
+      if (action === "actual") actualSize();
+      if (action === "export") exportComparison();
+    });
+    dialog.querySelectorAll(".sync-viewport").forEach((view) => {
+      view.addEventListener("wheel", (event) => {
+        event.preventDefault();
+        setZoom(zoom * (event.deltaY < 0 ? 1.2 : 1 / 1.2), view, event.clientX, event.clientY);
+      }, { passive: false });
+      view.addEventListener("pointerdown", (event) => {
+        if (event.button !== 0 || zoom <= 1) return;
+        drag = { pointerId: event.pointerId, view, x: event.clientX, y: event.clientY, centerX, centerY };
+        view.setPointerCapture(event.pointerId);
+        view.classList.add("dragging");
+      });
+      view.addEventListener("pointermove", (event) => {
+        if (!drag || drag.pointerId !== event.pointerId || drag.view !== view) return;
+        const fit = fittedSize(view);
+        centerX = drag.centerX - (event.clientX - drag.x) / (fit.width * zoom);
+        centerY = drag.centerY - (event.clientY - drag.y) / (fit.height * zoom);
+        renderTransform();
+      });
+      ["pointerup", "pointercancel", "lostpointercapture"].forEach((type) => view.addEventListener(type, (event) => {
+        if (drag?.pointerId !== event.pointerId) return;
+        drag = null;
+        view.classList.remove("dragging");
+        if (type !== "lostpointercapture" && view.hasPointerCapture(event.pointerId)) view.releasePointerCapture(event.pointerId);
+      }));
+      view.querySelector("img").addEventListener("load", renderTransform);
+    });
+    if (!window.reviewSyncResizeBound) window.addEventListener("resize", () => { if (dialog?.classList.contains("open")) renderTransform(); });
+    window.reviewSyncResizeBound = true;
+  }
+
+  function fittedSize(view) {
+    const image = view.querySelector("img");
+    const width = Number(image.dataset.width) || image.naturalWidth || 16;
+    const height = Number(image.dataset.height) || image.naturalHeight || 9;
+    const scale = Math.min(view.clientWidth / width, view.clientHeight / height);
+    return { width: width * scale, height: height * scale };
+  }
+
+  async function exportComparison() {
+    const button = dialog.querySelector('[data-action="export"]');
+    if (button.disabled) return;
+    const current = scenes()[sceneIndex];
+    const grid = dialog.querySelector('.sync-grid').getBoundingClientRect();
+    const snapshots = columns.map(([key, label]) => {
+      const view = dialog.querySelector(`[data-key="${key}"]`);
+      return { key, label, view: view.getBoundingClientRect(), image: view.querySelector('img').getBoundingClientRect() };
+    });
+    const scale = Math.min(window.devicePixelRatio || 1, 2);
+    const titleHeight = 42, labelHeight = 38, exportZoom = zoom;
+    const height = Math.max(...snapshots.map(s => s.view.height));
+    button.disabled = true;
+    button.textContent = '正在导出…';
+    try {
+      const originals = await Promise.all(snapshots.map(async s => {
+        await preload(current.images[s.key]);
+        return fullCache.get(current.images[s.key]).image;
+      }));
+      const canvas = document.createElement('canvas');
+      canvas.width = Math.ceil(grid.width * scale);
+      canvas.height = Math.ceil((titleHeight + labelHeight + height) * scale);
+      const ctx = canvas.getContext('2d');
+      ctx.scale(scale, scale);
+      ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, grid.width, titleHeight + labelHeight + height);
+      ctx.fillStyle = '#243b50'; ctx.font = '600 14px "Microsoft YaHei",sans-serif';
+      ctx.fillText(`第 ${String(current.number).padStart(3, '0')} 组 · ${current.categoryName} · ${Math.round(exportZoom * 100)}%`, 14, 27);
+      snapshots.forEach((s, i) => {
+        const x = s.view.left - grid.left, y = titleHeight + labelHeight;
+        ctx.fillStyle = ['#e8ecf0', '#e5f4fb', '#e8ecf0', '#e5f4fb'][i % 4];
+        ctx.fillRect(x, titleHeight, s.view.width, labelHeight);
+        ctx.fillStyle = i % 2 ? '#245a72' : '#4a5568'; ctx.font = '600 12px "Microsoft YaHei",sans-serif'; ctx.textAlign = 'center';
+        ctx.fillText(s.label, x + s.view.width / 2, titleHeight + 24);
+        ctx.save(); ctx.beginPath(); ctx.rect(x, y, s.view.width, s.view.height); ctx.clip();
+        ctx.fillStyle = '#eef1f4'; ctx.fillRect(x, y, s.view.width, s.view.height);
+        ctx.drawImage(originals[i], x + s.image.left - s.view.left, y + s.image.top - s.view.top, s.image.width, s.image.height);
+        ctx.restore();
+        if (i) { ctx.fillStyle = '#d7dfe7'; ctx.fillRect(x, titleHeight, 1, labelHeight + height); }
+      });
+      const blob = await new Promise((resolve, reject) => canvas.toBlob(b => b ? resolve(b) : reject(new Error('图片生成失败')), 'image/jpeg', 0.95));
+      const url = URL.createObjectURL(blob), link = document.createElement('a');
+      link.href = url; link.download = `实时4K_${String(current.number).padStart(3, '0')}_${current.categoryName}_当前对比.jpg`;
+      link.click(); setTimeout(() => URL.revokeObjectURL(url), 60000);
+      button.textContent = '已导出';
+    } catch (error) {
+      button.textContent = '导出失败，点击重试';
+      button.title = error.message || '原图加载失败，请重试';
+    } finally {
+      button.disabled = false;
+      setTimeout(() => { if (button.isConnected) button.textContent = '导出当前对比'; }, 3000);
+    }
+  }
+
+  function renderTransform() {
+    if (!dialog?.classList.contains("open")) return;
+    const views = [...dialog.querySelectorAll(".sync-viewport")];
+    const limits = views.map((view) => {
+      const fit = fittedSize(view);
+      return {
+        x: Math.max(0, (fit.width * zoom - view.clientWidth) / (2 * fit.width * zoom)),
+        y: Math.max(0, (fit.height * zoom - view.clientHeight) / (2 * fit.height * zoom)),
+      };
+    });
+    const maxX = Math.min(...limits.map((limit) => limit.x));
+    const maxY = Math.min(...limits.map((limit) => limit.y));
+    centerX = Math.max(0.5 - maxX, Math.min(0.5 + maxX, centerX));
+    centerY = Math.max(0.5 - maxY, Math.min(0.5 + maxY, centerY));
+    views.forEach((view) => {
+      const fit = fittedSize(view);
+      const image = view.querySelector("img");
+      image.style.width = `${fit.width}px`;
+      image.style.height = `${fit.height}px`;
+      image.style.transform = `translate(${(0.5 - centerX) * fit.width * zoom}px, ${(0.5 - centerY) * fit.height * zoom}px) scale(${zoom})`;
+    });
+    dialog.querySelector(".sync-readout").textContent = `${Math.round(zoom * 100)}%`;
+  }
+
+  function setZoom(next, view, clientX, clientY) {
+    const updated = Math.max(1, Math.min(64, next));
+    if (view && updated !== zoom) {
+      const fit = fittedSize(view);
+      const rect = view.getBoundingClientRect();
+      const offsetX = clientX - rect.left - rect.width / 2;
+      const offsetY = clientY - rect.top - rect.height / 2;
+      centerX += offsetX / (fit.width * zoom) - offsetX / (fit.width * updated);
+      centerY += offsetY / (fit.height * zoom) - offsetY / (fit.height * updated);
+    }
+    zoom = updated;
+    if (zoom === 1) centerX = centerY = 0.5;
+    renderTransform();
+    if (zoom >= 2.25) ensureFullImages();
+  }
+
+  function reset() {
+    zoom = 1;
+    centerX = centerY = 0.5;
+    renderTransform();
+  }
+
+  function preload(src) {
+    if (fullCache.has(src)) return fullCache.get(src);
+    const image = new Image();
+    image.decoding = "async";
+    image.fetchPriority = "high";
+    const promise = new Promise((resolve, reject) => {
+      image.onload = () => resolve(src);
+      image.onerror = reject;
+      image.src = src;
+    });
+    promise.image = image;
+    fullCache.set(src, promise);
+    promise.catch(() => fullCache.delete(src));
+    return promise;
+  }
+
+  async function ensureFullImages() {
+    const token = loadToken;
+    const current = scenes()[sceneIndex];
+    if (!current) return;
+    const pending = columns.map(([key]) => async () => {
+      const view = dialog.querySelector(`[data-key="${key}"]`);
+      const image = view.querySelector("img");
+      if (image.dataset.fullReady === "true") return;
+      view.classList.add("loading-full");
+      await preload(current.images[key]);
+      if (token !== loadToken) return;
+      image.src = current.images[key];
+      image.dataset.fullReady = "true";
+      image.dataset.width = image.naturalWidth || image.dataset.width;
+      image.dataset.height = image.naturalHeight || image.dataset.height;
+      if (image.decode) await image.decode().catch(() => {});
+      view.classList.remove("loading-full");
+    });
+    let next = 0;
+    async function worker() {
+      while (next < pending.length && token === loadToken) {
+        const task = pending[next++];
+        await task().catch(() => {});
+      }
+    }
+    await Promise.all([worker(), worker()]);
+    if (token === loadToken) renderTransform();
+  }
+
+  async function actualSize() {
+    const token = loadToken;
+    await ensureFullImages();
+    if (token !== loadToken || !dialog?.classList.contains("open")) return;
+    const view = dialog.querySelector('[data-key="original"]');
+    const image = view.querySelector("img");
+    if (image.naturalWidth) setZoom(image.naturalWidth / fittedSize(view).width);
+  }
+
+  function showScene(preserveView = false) {
+    const current = scenes()[sceneIndex];
+    if (!current) return;
+    loadToken += 1;
+    dialog.querySelector(".sync-title").textContent = `第 ${String(current.number).padStart(3, "0")} 组`;
+    dialog.querySelectorAll("[data-sync-dataset]").forEach(button => {
+      const active = button.dataset.syncDataset === dataset;
+      button.classList.toggle("active", active);
+      button.setAttribute("aria-selected", String(active));
+    });
+    columns.forEach(([key]) => {
+      const view = dialog.querySelector(`[data-key="${key}"]`);
+      const image = view.querySelector("img");
+      view.classList.remove("loading-full");
+      image.dataset.fullReady = "false";
+      image.dataset.width = String(current.width || 16);
+      image.dataset.height = String(current.height || 9);
+      image.src = current.previews?.[key] || current.thumbs?.[key] || current.images[key];
+    });
+    dialog.querySelector('[data-action="prev"]').disabled = sceneIndex <= 0;
+    dialog.querySelector('[data-action="next"]').disabled = sceneIndex >= scenes().length - 1;
+    if (preserveView) renderTransform(); else reset();
+    if (zoom >= 2.25) ensureFullImages();
+  }
+
+  function switchDataset(nextDataset) {
+    if (!fourMode || nextDataset === dataset || !window.REVIEW_DATA.datasets[nextDataset]) return;
+    const number = scenes()[sceneIndex].number;
+    const saved = { zoom, centerX, centerY };
+    loadToken += 1;
+    dialog.remove();
+    dataset = nextDataset;
+    columns = currentColumns();
+    sceneIndex = Math.max(0, scenes().findIndex(scene => scene.number === number));
+    drag = null;
+    init();
+    dialog.classList.add("open");
+    ({ zoom, centerX, centerY } = saved);
+    showScene(true);
+    dialog.querySelector(`[data-sync-dataset="${dataset}"]`).focus({ preventScroll: true });
+  }
+
+  function changeScene(delta) {
+    sceneIndex = Math.max(0, Math.min(scenes().length - 1, sceneIndex + delta));
+    showScene();
+  }
+
+  function close() {
+    loadToken += 1;
+    dialog.classList.remove("open");
+    document.body.classList.remove("sync-open");
+    drag = null;
+    opener?.focus();
+  }
+
+  document.addEventListener("review:details", (event) => {
+    const nextDataset = event.detail.dataset;
+    if (dialog) { close(); dialog.remove(); dialog = null; }
+    fourMode = nextDataset === "1014";
+    dataset = nextDataset;
+    columns = currentColumns();
+    if (!dialog) init();
+    sceneIndex = Math.max(0, scenes().findIndex((scene) => scene.id === event.detail.id));
+    opener = document.querySelector(`[data-detail="${event.detail.id}"]`);
+    dialog.classList.add("open");
+    document.body.classList.add("sync-open");
+    showScene();
+    dialog.querySelector(".sync-close").focus();
+  });
+
+  document.addEventListener("keydown", (event) => {
+    if (!dialog?.classList.contains("open")) return;
+    if (event.key === "Escape") close();
+    if (event.key === "ArrowLeft") changeScene(-1);
+    if (event.key === "ArrowRight") changeScene(1);
+  });
+})();
+
+
+
